@@ -1,0 +1,79 @@
+# .github/workflows/release-passport.yml
+# Build -> push -> scan the pushed digest with Trivy -> ask Release Passport for a passport.
+# Authentication is GitHub's own short-lived OIDC token: there is no secret to create or rotate.
+name: release-passport
+
+on:
+  push:
+    branches: [main]        # runs on the default branch maintain the baseline (existing risk)
+  pull_request:             # pull requests are judged on the NEW risk they introduce
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write           # push the image to ghcr.io
+  id-token: write           # lets the job request an OIDC token for Release Passport
+
+env:
+  PASSPORT_API: https://func-releaseguard-e2a10c.azurewebsites.net
+  PASSPORT_PROJECT: prj_410dae2adb50
+  PASSPORT_AUDIENCE: release-passport
+  PASSPORT_CLI_URL: https://lemon-moss-0e2f7d103.3.azurestaticapps.net/cli/passport.py
+  TRIVY_IMAGE: aquasec/trivy:0.58.1   # pin, and bump deliberately
+
+jobs:
+  passport:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.ref.outputs.image }}      # registry/repo@sha256:... for a deploy job
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image name (registry paths must be lowercase)
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          provenance: false
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+
+      - name: Image reference by digest
+        id: ref
+        run: echo "image=$IMAGE@${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+
+      - name: Scan the pushed digest (Trivy, all severities)
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" -e TRIVY_USERNAME -e TRIVY_PASSWORD \
+            -v "$PWD:/work" -w /work "$TRIVY_IMAGE" image \
+            --cache-dir /work/.trivycache --scanners vuln --format json --output trivy.json \
+            "${{ steps.ref.outputs.image }}"
+
+      - name: Request release passport
+        run: |
+          curl -fsSL "$PASSPORT_CLI_URL" -o passport.py
+          python3 passport.py permit --image "${{ steps.ref.outputs.image }}" --report trivy.json
+
+      - name: Keep evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-passport
+          path: |
+            trivy.json
+            passport.jwt
+          if-no-files-found: ignore
+
+  # Deploy only what holds a passport: see runtime/deploy-gate/github-deploy-job.yml
