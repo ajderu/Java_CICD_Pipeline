@@ -5,7 +5,7 @@ name: release-passport
 
 on:
   push:
-    branches: [main]        # runs on the default branch maintain the baseline (existing risk)
+    branches: [main]   # runs on the default branch maintain the baseline (existing risk)
   pull_request:             # pull requests are judged on the NEW risk they introduce
   workflow_dispatch:
 
@@ -16,9 +16,9 @@ permissions:
 
 env:
   PASSPORT_API: https://func-releaseguard-e2a10c.azurewebsites.net
-  PASSPORT_PROJECT: prj_410dae2adb50
+  PASSPORT_PROJECT: prj_345c35a4e2b8
   PASSPORT_AUDIENCE: release-passport
-  PASSPORT_CLI_URL: https://lemon-moss-0e2f7d103.3.azurestaticapps.net/cli/passport.py
+  PASSPORT_CLI_URL: https://proud-beach-0d61b8503.1.azurestaticapps.net/cli/passport.py
   TRIVY_IMAGE: aquasec/trivy:0.58.1   # pin, and bump deliberately
 
 jobs:
@@ -31,6 +31,11 @@ jobs:
 
       - name: Image name (registry paths must be lowercase)
         run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Which checks are enabled (the dashboard decides, not this file)
+        run: |
+          curl -fsSL "$PASSPORT_CLI_URL" -o passport.py
+          python3 passport.py stages >> "$GITHUB_ENV"
 
       - uses: docker/login-action@v3
         with:
@@ -51,20 +56,57 @@ jobs:
         id: ref
         run: echo "image=$IMAGE@${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
 
-      - name: Scan the pushed digest (Trivy, all severities)
+      # Skipped when Image security is switched off in the dashboard. Without this scan the
+      # passport rests on the pipeline identity and the digest alone, which the run records.
+      - name: Image security (Trivy, operating-system packages)
+        if: env.PASSPORT_STAGE_IMAGE == '1'
         env:
           TRIVY_USERNAME: ${{ github.actor }}
           TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: |
           docker run --rm --user "$(id -u):$(id -g)" -e TRIVY_USERNAME -e TRIVY_PASSWORD \
             -v "$PWD:/work" -w /work "$TRIVY_IMAGE" image \
-            --cache-dir /work/.trivycache --scanners vuln --format json --output trivy.json \
-            "${{ steps.ref.outputs.image }}"
+            --cache-dir /work/.trivycache --scanners vuln --pkg-types os \
+            --format json --output trivy.json "${{ steps.ref.outputs.image }}"
+
+      - name: Dependencies (Trivy, application libraries)
+        if: env.PASSPORT_STAGE_SCA == '1'
+        continue-on-error: true   # a broken scanner is reported on the run, not hidden here
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" -e TRIVY_USERNAME -e TRIVY_PASSWORD \
+            -v "$PWD:/work" -w /work "$TRIVY_IMAGE" image \
+            --cache-dir /work/.trivycache --scanners vuln --pkg-types library \
+            --format json --output trivy-sca.json "${{ steps.ref.outputs.image }}"
+
+      - name: Secret detection (Gitleaks)
+        if: env.PASSPORT_STAGE_SECRETS == '1'
+        continue-on-error: true   # a broken scanner is reported on the run, not hidden here
+        run: |
+          # 'dir' scans the files as they are now. 'detect' would only look at commit history,
+          # which a shallow checkout truncates to one commit, so a secret committed earlier is missed.
+          curl -fsSL "${PASSPORT_CLI_URL%/*}/gitleaks.toml" -o gitleaks.toml
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo" -w /repo \
+            zricethezav/gitleaks:v8.21.2 dir . -c gitleaks.toml \
+            --report-format json --report-path gitleaks.json --no-banner --exit-code 0
+
+      - name: Code analysis (Semgrep)
+        if: env.PASSPORT_STAGE_SAST == '1'
+        continue-on-error: true
+        run: |
+          mkdir -p "$RUNNER_TEMP/semgrep-home"
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$PWD:/src" -v "$RUNNER_TEMP/semgrep-home:/sghome" -w /src \
+            -e HOME=/sghome -e SEMGREP_SETTINGS_FILE=/sghome/settings.yml \
+            semgrep/semgrep:1.97.0 semgrep scan --config p/default --json --output semgrep.json --quiet --metrics=off
 
       - name: Request release passport
         run: |
-          curl -fsSL "$PASSPORT_CLI_URL" -o passport.py
-          python3 passport.py permit --image "${{ steps.ref.outputs.image }}" --report trivy.json
+          python3 passport.py permit --image "${{ steps.ref.outputs.image }}" --report trivy.json \
+            --stage-report sca=trivy-sca.json \
+            --stage-report secrets=gitleaks.json --stage-report sast=semgrep.json
 
       - name: Keep evidence
         if: always()
@@ -73,6 +115,9 @@ jobs:
           name: release-passport
           path: |
             trivy.json
+            trivy-sca.json
+            gitleaks.json
+            semgrep.json
             passport.jwt
           if-no-files-found: ignore
 
