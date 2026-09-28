@@ -12,4 +12,3 @@ public class MyTest {
     public void test_method_2() {
     }
 }
-Dentbxos#.4$!.x
